@@ -2,7 +2,7 @@
 import time
 import requests
 from typing import Dict, Any, Optional, List, Tuple
-from universal_cache import current_slot, get_cached, set_cached
+from universal_cache import current_slot, get_json, set_json
 
 BASE = "https://statsapi.mlb.com/api/v1"
 
@@ -25,7 +25,7 @@ def lookup_player_id(name: str, team_hint: Optional[str] = None) -> Optional[int
     Cached by name for the current process lifetime via universal_cache.
     """
     name_key = _cache_key_player_id(name)
-    cached = get_cached(name_key)
+    cached = get_json(name_key)
     if cached is not None:
         return cached
 
@@ -34,7 +34,7 @@ def lookup_player_id(name: str, team_hint: Optional[str] = None) -> Optional[int
     candidates = data.get("people", []) or []
 
     if not candidates:
-        set_cached(name_key, None)
+        set_json(name_key, None)
         return None
 
     # If team_hint provided, try to pick the candidate with that team in lastPlayedTeam
@@ -43,12 +43,12 @@ def lookup_player_id(name: str, team_hint: Optional[str] = None) -> Optional[int
         for c in candidates:
             last_team = (c.get("lastPlayedTeam", {}) or {}).get("name", "") or c.get("fullFMLName", "")
             if team_hint_l in (last_team or "").lower():
-                set_cached(name_key, c.get("id"))
+                set_json(name_key, c.get("id"))
                 return c.get("id")
 
     # Fallback: first candidate
     pid = candidates[0].get("id")
-    set_cached(name_key, pid)
+    set_json(name_key, pid)
     return pid
 
 def _get_batting_gamelogs(pid: int, season: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -86,13 +86,13 @@ def last10_trends_for(pid: int) -> Optional[Dict[str, Any]]:
     Cached until next slot boundary.
     """
     ck = _cache_key_trends(pid)
-    cached = get_cached(ck)
+    cached = get_json(ck)
     if cached is not None:
         return cached
 
     logs = _get_batting_gamelogs(pid)
     if not logs:
-        set_cached(ck, None)
+        set_json(ck, None)
         return None
 
     # Most responses are chronological; sort by date desc just in case
@@ -103,7 +103,7 @@ def last10_trends_for(pid: int) -> Optional[Dict[str, Any]]:
     last10 = logs[:10]
 
     if not last10:
-        set_cached(ck, None)
+        set_json(ck, None)
         return None
 
     hit_g = 0; multi_g = 0; xbh_g = 0; tb_sum = 0
@@ -129,7 +129,7 @@ def last10_trends_for(pid: int) -> Optional[Dict[str, Any]]:
         "multi_hit_rate": round(multi_g / n, 3),
         "xbh_rate": round(xbh_g / n, 3),
     }
-    set_cached(ck, trends)
+    set_json(ck, trends)
     return trends
 
 def trends_by_player_names(names: List[str], team_lookup: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:

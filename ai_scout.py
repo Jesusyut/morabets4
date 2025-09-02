@@ -5,6 +5,10 @@ import math
 # MLB trends integration
 from mlb_trends import trends_by_player_names
 
+# Universal cache integration
+from universal_cache import slot_key, get_json, set_json
+from datetime import datetime
+
 # ---------- EV utilities ----------
 def american_profit(odds: int) -> float:
     return odds / 100.0 if odds >= 0 else 100.0 / abs(odds)
@@ -166,3 +170,23 @@ def merge_and_gate(llm_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         except Exception:
             continue
     return sorted(out, key=lambda d: d["ev"], reverse=True)
+
+def scout_cached_for_league(client, rows: List[Dict[str, Any]], league: str = "mlb", top_k: int = 30, force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Cache the LLM-ranked picks per league in the same Phoenix slot.
+    Key: ai:scout:{league}:{date}:{slot}
+    """
+    key = slot_key("ai", league, suffix="scout")
+    if not force_refresh:
+        cached = get_json(key)
+        if cached is not None:
+            return cached
+
+    payload = build_llm_payload(rows, top_k=top_k)
+    llm_json = llm_scout(client, payload)
+    picks = merge_and_gate(llm_json)
+    base = [p for p in picks if p.get("type") == "base"][:10]
+    upg  = [p for p in picks if p.get("type") == "upgrade"][:10]
+    out = {"league": league, "base": base, "upgrades": upg, "count": {"base": len(base), "upgrades": len(upg)}}
+    set_json(key, out)
+    return out

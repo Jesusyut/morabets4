@@ -33,7 +33,7 @@ except Exception:
 from ai_scout import build_llm_payload, llm_scout, merge_and_gate
 
 # Universal cache imports
-from universal_cache import get_or_set, get_cached, set_cached
+from universal_cache import get_or_set_slot, slot_key, set_json, get_json, current_slot
 
 log = logging.getLogger("app")
 log.setLevel(logging.INFO)
@@ -450,9 +450,9 @@ def get_props():
         if league == "mlb":
             if nocache:
                 props = fetch_mlb_player_props()
-                set_cached("mlb", props)
+                set_json(slot_key("props", "mlb"), props)
             else:
-                props = get_or_set("mlb", fetch_mlb_player_props)
+                props = get_or_set_slot("props", "mlb", fetch_mlb_player_props)
             # Group by matchup - need to create matchup from event data
             grouped = {}
             for prop in props:
@@ -467,11 +467,12 @@ def get_props():
             return jsonify(grouped)
 
         elif league == "nfl":
+            from nfl_odds_api import fetch_nfl_player_props
             if nocache:
                 props = fetch_nfl_player_props(hours_ahead=96)
-                set_cached("nfl", props)
+                set_json(slot_key("props", "nfl"), props)
             else:
-                props = get_or_set("nfl", lambda: fetch_nfl_player_props(hours_ahead=96))
+                props = get_or_set_slot("props", "nfl", fetch_nfl_player_props)
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -482,11 +483,12 @@ def get_props():
             return jsonify(grouped)
 
         elif league == "ncaaf":
+            from props_ncaaf import fetch_ncaaf_player_props
             if nocache:
                 props = fetch_ncaaf_player_props(date=date_str)
-                set_cached("ncaaf", props)
+                set_json(slot_key("props", "ncaaf"), props)
             else:
-                props = get_or_set("ncaaf", lambda: fetch_ncaaf_player_props(date=date_str))
+                props = get_or_set_slot("props", "ncaaf", lambda: fetch_ncaaf_player_props(date=date_str))
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -498,11 +500,12 @@ def get_props():
 
         elif league == "ufc":
             # Use the existing UFC totals function
+            from props_ufc import fetch_ufc_totals_props
             if nocache:
                 props = fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96)
-                set_cached("ufc", props)
+                set_json(slot_key("props", "ufc"), props)
             else:
-                props = get_or_set("ufc", lambda: fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96))
+                props = get_or_set_slot("props", "ufc", lambda: fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96))
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -520,7 +523,6 @@ def get_props():
         return jsonify({"error": str(e)}), 503
 
 @app.route("/ai/edge_scout")
-@cache_ttl(seconds=60)
 def ai_edge_scout():
     """
     AI-assisted shortlist: uses our no-vig probs & best prices, plus trends,
@@ -528,55 +530,24 @@ def ai_edge_scout():
     v1: MLB only (expand later).
     """
     from openai import OpenAI
+    from ai_scout import scout_cached_for_league
+    
     league_in = request.args.get("league")
     league = _norm_league(league_in)
     if league != "mlb":
         return jsonify({"error": f"league '{league_in}' not supported in v1"}), 400
 
-    # pull rows using universal cache (already wired in app.py)
-    rows = get_or_set("mlb", fetch_mlb_player_props)
-    payload = build_llm_payload(rows, top_k=30)
+    # props must come from the same slot cache to keep consistency
+    rows = get_or_set_slot("props", "mlb", fetch_mlb_player_props)
 
-    # require OPENAI_API_KEY in env (Render: add it under Environment)
     try:
-        client = OpenAI()
+        client = OpenAI()  # uses OPENAI_API_KEY env
     except Exception as e:
         return jsonify({"error": "OPENAI_API_KEY not configured", "detail": str(e)}), 503
 
-    llm_json = llm_scout(client, payload)
-    picks = merge_and_gate(llm_json)
-
-    # split into base vs upgrade (max 10 each)
-    base = [p for p in picks if p.get("type") == "base"][:10]
-    upg  = [p for p in picks if p.get("type") == "upgrade"][:10]
-    
-    # Collect unique player names from the top results for trends
-    all_player_names = list(set([p["player"] for p in base + upg]))
-    name_to_trend = {}
-    try:
-        from mlb_trends import trends_by_player_names
-        name_to_trend = trends_by_player_names(all_player_names)
-    except Exception:
-        name_to_trend = {}
-    
-    # Attach trends to each pick
-    for picks_list in [base, upg]:
-        for pick in picks_list:
-            t = name_to_trend.get(pick["player"])
-            if t:
-                pick["trends"] = {
-                    "l10_hit_rate": t.get("l10_hit_rate"),
-                    "l10_tb_avg": t.get("l10_tb_avg"),
-                    "multi_hit_rate": t.get("multi_hit_rate"),
-                    "xbh_rate": t.get("xbh_rate"),
-                }
-
-    return jsonify({
-        "league": league,
-        "base": base,
-        "upgrades": upg,
-        "count": {"base": len(base), "upgrades": len(upg)}
-    })
+    nocache = request.args.get("nocache") == "1"
+    out = scout_cached_for_league(client, rows, league="mlb", top_k=30, force_refresh=nocache)
+    return jsonify(out)
 
 # Stub endpoints to avoid UI errors
 @app.route("/contextual/hit_rates", methods=["POST"])
@@ -602,29 +573,53 @@ def ping():
 
 @app.route("/_cron/prewarm")
 def cron_prewarm():
-    # protect with a simple shared secret
+    # simple auth
     token = request.args.get("key")
     if token != os.getenv("CRON_KEY"):
         return jsonify({"error":"unauthorized"}), 401
-    leagues = request.args.get("leagues","mlb,nfl,ncaaf,ufc").split(",")
+
+    leagues = [l.strip() for l in (request.args.get("leagues","mlb,nfl,ncaaf,ufc").split(",")) if l.strip()]
     out = {}
-    for L in [l.strip() for l in leagues if l.strip()]:
+    for L in leagues:
         if L == "mlb":
+            # props
             props = fetch_mlb_player_props()
+            set_json(slot_key("props", "mlb"), props)
+
+            # ai scout (optional: only for mlb v1)
+            try:
+                from openai import OpenAI
+                from ai_scout import scout_cached_for_league
+                client = OpenAI()
+                _ = scout_cached_for_league(client, props, league="mlb", top_k=30, force_refresh=True)
+            except Exception as e:
+                out["mlb_ai"] = f"error: {e}"
         elif L == "nfl":
-            from nfl_odds_api import fetch_nfl_player_props
-            props = fetch_nfl_player_props()
+            try:
+                from nfl_odds_api import fetch_nfl_player_props
+                props = fetch_nfl_player_props()
+                set_json(slot_key("props", "nfl"), props)
+            except Exception as e:
+                out["nfl"] = f"error: {e}"
         elif L == "ncaaf":
-            from props_ncaaf import fetch_ncaaf_player_props
-            props = fetch_ncaaf_player_props()
+            try:
+                from props_ncaaf import fetch_ncaaf_player_props
+                props = fetch_ncaaf_player_props()
+                set_json(slot_key("props", "ncaaf"), props)
+            except Exception as e:
+                out["ncaaf"] = f"error: {e}"
         elif L == "ufc":
-            from props_ufc import fetch_ufc_totals_props
-            props = fetch_ufc_totals_props(hours_ahead=96)
+            try:
+                from props_ufc import fetch_ufc_totals_props
+                props = fetch_ufc_totals_props(hours_ahead=96)
+                set_json(slot_key("props", "ufc"), props)
+            except Exception as e:
+                out["ufc"] = f"error: {e}"
         else:
-            continue
-        set_cached(L, props)
-        out[L] = len(props) if isinstance(props, list) else "ok"
-    return jsonify({"prewarmed": out})
+            out[L] = "skipped: unsupported"
+
+    out["status"] = "ok"
+    return jsonify(out)
 
 @app.route("/logout")
 def logout():

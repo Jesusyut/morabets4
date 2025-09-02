@@ -1,17 +1,17 @@
 # universal_cache.py
 import os, json, time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional, Dict
+from typing import Any, Optional, Dict, Callable
 try:
     from zoneinfo import ZoneInfo
-except ImportError:
+except Exception:
     ZoneInfo = None
 
 PHX_TZ = ZoneInfo("America/Phoenix") if ZoneInfo else None
 
 # Optional Redis
-_redis = None
 REDIS_URL = os.getenv("REDIS_URL", "")
+_redis = None
 if REDIS_URL:
     try:
         import redis
@@ -19,20 +19,21 @@ if REDIS_URL:
     except Exception:
         _redis = None
 
-# Fallback memory cache: {key: {"exp": epoch_sec, "val": json_str}}
+# In-proc fallback
 _mem: Dict[str, Dict[str, Any]] = {}
 
-SLOTS = [8, 13, 18]  # local hours in America/Phoenix
+CACHE_PREFIX = os.getenv("CACHE_PREFIX", "")
+CACHE_VERSION = os.getenv("CACHE_VERSION", "v1")  # bump to invalidate
+
+SLOTS = [8, 13, 18]  # local hours
 
 def _now_local() -> datetime:
     utc = datetime.now(timezone.utc)
     return utc.astimezone(PHX_TZ) if PHX_TZ else utc
 
 def current_slot(dt: Optional[datetime] = None) -> tuple[str, datetime]:
-    """Return (slot_name, next_boundary_local) based on Phoenix local time."""
     dt = dt or _now_local()
     h = dt.hour
-    # Boundaries: 08, 13, 18; everything before 08 belongs to 'night'
     if h < 8:
         slot = "night"
         next_b = dt.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -44,47 +45,45 @@ def current_slot(dt: Optional[datetime] = None) -> tuple[str, datetime]:
         next_b = dt.replace(hour=18, minute=0, second=0, microsecond=0)
     else:
         slot = "night"
-        # next is tomorrow 08:00
-        next_day = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
-        next_b = next_day
+        next_b = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
     return slot, next_b
 
-def _key(league: str, dt: Optional[datetime] = None) -> str:
-    dt = dt or _now_local()
-    d = dt.date().isoformat()
-    slot, _ = current_slot(dt)
-    return f"props:{league}:{d}:{slot}"
-
-def _ttl_seconds(next_boundary: datetime) -> int:
+def _ttl_to_next_boundary(next_boundary: datetime) -> int:
     now = _now_local()
     ttl = int((next_boundary - now).total_seconds())
-    return max(ttl, 60)  # at least 60s
+    return max(ttl, 60)
 
-def get_cached(league: str) -> Optional[Any]:
-    k = _key(league)
+def slot_key(namespace: str, league: str, suffix: str = "") -> str:
+    dt = _now_local()
+    d = dt.date().isoformat()
+    slot, _ = current_slot(dt)
+    prefix = f"{CACHE_PREFIX}:" if CACHE_PREFIX else ""
+    suf = f":{suffix}" if suffix else ""
+    return f"{prefix}{CACHE_VERSION}:{namespace}:{league}:{d}:{slot}{suf}"
+
+def get_json(key: str) -> Optional[Any]:
     if _redis:
-        raw = _redis.get(k)
-        if raw: return json.loads(raw)
-    else:
-        rec = _mem.get(k)
-        if rec and rec["exp"] > time.time():
-            return json.loads(rec["val"])
+        raw = _redis.get(key)
+        return json.loads(raw) if raw else None
+    rec = _mem.get(key)
+    if rec and rec["exp"] > time.time():
+        return json.loads(rec["val"])
     return None
 
-def set_cached(league: str, value: Any) -> None:
-    k = _key(league)
+def set_json(key: str, value: Any, ttl_seconds: Optional[int] = None) -> None:
     _, next_b = current_slot()
-    ttl = _ttl_seconds(next_b)
+    ttl = ttl_seconds if ttl_seconds is not None else _ttl_to_next_boundary(next_b)
     raw = json.dumps(value)
     if _redis:
-        _redis.setex(k, ttl, raw)
+        _redis.setex(key, ttl, raw)
     else:
-        _mem[k] = {"exp": time.time() + ttl, "val": raw}
+        _mem[key] = {"exp": time.time() + ttl, "val": raw}
 
-def get_or_set(league: str, fetcher: Callable[[], Any]) -> Any:
-    data = get_cached(league)
-    if data is not None:
-        return data
+def get_or_set_slot(namespace: str, league: str, fetcher: Callable[[], Any], suffix: str = "") -> Any:
+    k = slot_key(namespace, league, suffix=suffix)
+    cached = get_json(k)
+    if cached is not None:
+        return cached
     data = fetcher()
-    set_cached(league, data)
+    set_json(k, data)
     return data
