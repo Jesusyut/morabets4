@@ -1,52 +1,147 @@
 # mlb_trends.py
-import os, time, math
-from datetime import date
+import time
 import requests
-from requests.adapters import HTTPAdapter, Retry
+from typing import Dict, Any, Optional, List, Tuple
+from universal_cache import current_slot, get_cached, set_cached
 
-MLB = "https://statsapi.mlb.com/api/v1"
-TIMEOUT = float(os.getenv("MLB_TIMEOUT","4"))
+BASE = "https://statsapi.mlb.com/api/v1"
 
-session = requests.Session()
-session.headers.update({"User-Agent":"MoraBets/1.0"})
-session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.3, status_forcelist=[429,500,502,503,504])))
+def _cache_key_player_id(name: str) -> str:
+    return f"mlb:pid:{name.strip().lower()}"
 
-STAT_KEY_MAP = {
-    "batter_hits":"hits", "hits":"hits",
-    "batter_total_bases":"totalBases", "total_bases":"totalBases", "tb":"totalBases",
-}
+def _cache_key_trends(pid: int) -> str:
+    # cache trends to the current Phoenix slot
+    slot, _ = current_slot()
+    return f"mlb:trends:{slot}:{pid}"
 
-def _get(url, params=None):
-    return session.get(url, params=params, timeout=TIMEOUT)
+def _http_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
-def resolve_player_id(name:str)->int:
-    r = _get(f"{MLB}/people/search", params={"names": name})
-    js = r.json() or {}
-    people = js.get("people") or []
-    if not people: raise ValueError(f"player not found: {name}")
-    return int(people[0]["id"])
+def lookup_player_id(name: str, team_hint: Optional[str] = None) -> Optional[int]:
+    """
+    Resolve MLBAM personId from a player name (optionally bias with team name).
+    Cached by name for the current process lifetime via universal_cache.
+    """
+    name_key = _cache_key_player_id(name)
+    cached = get_cached(name_key)
+    if cached is not None:
+        return cached
 
-def game_logs(pid:int, season:int, group:str="hitting"):
-    r = _get(f"{MLB}/people/{pid}/stats", params={"stats":"gameLog","season":season,"group":group})
-    js = r.json() or {}
-    return ((js.get("stats") or [{}])[0] or {}).get("splits", []) or []
+    # Search by text; MLB Stats API will fuzzy-match
+    data = _http_json(f"{BASE}/people", params={"search": name})
+    candidates = data.get("people", []) or []
 
-def last10_rate(player_name:str, stat_type:str, threshold:float):
-    pid = resolve_player_id(player_name)
-    key = STAT_KEY_MAP.get(stat_type.lower(), stat_type)
-    logs = game_logs(pid, date.today().year) or []
-    if len(logs) < 10:
-        logs += game_logs(pid, date.today().year - 1)
-    vals = []
-    for s in logs[:10]:
-        stat = (s.get("stat") or {})
-        vals.append(float(stat.get(key, 0) or 0))
-    n = len(vals)
-    if n == 0: return {"hit_rate":0.0,"sample_size":0,"confidence":"low","threshold":float(threshold)}
-    overs = sum(1 for v in vals if v >= float(threshold))
-    rate = overs / n
-    # simple confidence label
-    se = math.sqrt(max(rate*(1-rate),1e-9)/max(n,1))
-    z = abs(rate-0.5)/max(se,1e-9)
-    conf = "high" if (n>=8 and z>=1.5) else ("medium" if z>=0.8 else "low")
-    return {"hit_rate":round(rate,4),"sample_size":n,"confidence":conf,"threshold":float(threshold)}
+    if not candidates:
+        set_cached(name_key, None)
+        return None
+
+    # If team_hint provided, try to pick the candidate with that team in lastPlayedTeam
+    if team_hint:
+        team_hint_l = team_hint.strip().lower()
+        for c in candidates:
+            last_team = (c.get("lastPlayedTeam", {}) or {}).get("name", "") or c.get("fullFMLName", "")
+            if team_hint_l in (last_team or "").lower():
+                set_cached(name_key, c.get("id"))
+                return c.get("id")
+
+    # Fallback: first candidate
+    pid = candidates[0].get("id")
+    set_cached(name_key, pid)
+    return pid
+
+def _get_batting_gamelogs(pid: int, season: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Return recent hitting game logs for the given player id."""
+    from datetime import datetime
+    year = season or datetime.now().year
+    # gameLog stats group=hitting
+    data = _http_json(
+        f"{BASE}/people/{pid}/stats",
+        params={"stats": "gameLog", "group": "hitting", "season": year},
+    )
+    splits = (((data.get("stats") or [{}])[0]).get("splits") or [])
+    return splits  # each split has 'stat' and 'date' etc.
+
+def _tb_from_stat(stat: Dict[str, Any]) -> int:
+    """
+    Compute Total Bases if not provided:
+    1B + 2*2B + 3*3B + 4*HR; where 1B = H - 2B - 3B - HR
+    """
+    h  = int(stat.get("hits", 0))
+    d2 = int(stat.get("doubles", 0))
+    d3 = int(stat.get("triples", 0))
+    hr = int(stat.get("homeRuns", 0))
+    one_b = max(h - d2 - d3 - hr, 0)
+    return one_b + 2*d2 + 3*d3 + 4*hr
+
+def last10_trends_for(pid: int) -> Optional[Dict[str, Any]]:
+    """
+    Compute last-10 trends for a batter:
+      - l10_hit_rate:   % of games with >=1 hit
+      - l10_tb_avg:     average total bases
+      - multi_hit_rate: % of games with >=2 hits
+      - xbh_rate:       % of games with >=1 extra-base hit (2B/3B/HR)
+      - games:          number of games considered
+    Cached until next slot boundary.
+    """
+    ck = _cache_key_trends(pid)
+    cached = get_cached(ck)
+    if cached is not None:
+        return cached
+
+    logs = _get_batting_gamelogs(pid)
+    if not logs:
+        set_cached(ck, None)
+        return None
+
+    # Most responses are chronological; sort by date desc just in case
+    try:
+        logs.sort(key=lambda s: s.get("date",""), reverse=True)
+    except Exception:
+        pass
+    last10 = logs[:10]
+
+    if not last10:
+        set_cached(ck, None)
+        return None
+
+    hit_g = 0; multi_g = 0; xbh_g = 0; tb_sum = 0
+    for g in last10:
+        st = g.get("stat") or {}
+        hits = int(st.get("hits", 0))
+        d2 = int(st.get("doubles", 0))
+        d3 = int(st.get("triples", 0))
+        hr = int(st.get("homeRuns", 0))
+
+        if hits >= 1: hit_g += 1
+        if hits >= 2: multi_g += 1
+        if (d2 + d3 + hr) >= 1: xbh_g += 1
+
+        tb = int(st.get("totalBases", _tb_from_stat(st)))
+        tb_sum += tb
+
+    n = len(last10)
+    trends = {
+        "games": n,
+        "l10_hit_rate": round(hit_g / n, 3),
+        "l10_tb_avg": round(tb_sum / n, 3),
+        "multi_hit_rate": round(multi_g / n, 3),
+        "xbh_rate": round(xbh_g / n, 3),
+    }
+    set_cached(ck, trends)
+    return trends
+
+def trends_by_player_names(names: List[str], team_lookup: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Bulk helper: map player name -> trends dict (best-effort).
+    team_lookup optional mapping: name -> team name (improves ID resolution).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in names:
+        pid = lookup_player_id(name, (team_lookup or {}).get(name))
+        if not pid: 
+            continue
+        t = last10_trends_for(pid)
+        if t: out[name] = t
+    return out

@@ -22,10 +22,23 @@ from novig import american_to_prob, novig_two_way
 from cache_ttl import metrics as cache_metrics
 import perf
 
+# AI scout imports
+try:
+    from cache_ttl import cache_ttl  # if present in repo
+except Exception:
+    def cache_ttl(seconds=60):
+        def deco(fn): return fn
+        return deco
+
+from ai_scout import build_llm_payload, llm_scout, merge_and_gate
+
+# Universal cache imports
+from universal_cache import get_or_set, get_cached, set_cached
+
 log = logging.getLogger("app")
 log.setLevel(logging.INFO)
 
-def _norm_league(s: str | None) -> str:
+def _norm_league(s: str = None) -> str:
     """Normalize league names with aliases"""
     t = (s or "").strip().lower()
     aliases = {
@@ -410,7 +423,7 @@ def require_license():
     # Allow access to public pages, verification, health checks, API endpoints, and static files
     public_endpoints = [
         "home", "how_it_works", "paywall", "paywall_config", "tool", "verify", "verify_key", "validate_key", "create_checkout_session", 
-        "healthz", "ping", "static", "logout", "dashboard", "dashboard_legacy"
+        "healthz", "ping", "static", "logout", "dashboard", "dashboard_legacy", "ai_edge_scout", "cron_prewarm"
     ]
     
     # Also allow access to any route starting with /api/
@@ -431,8 +444,15 @@ def get_props():
         date_str = request.args.get("date")  # YYYY-MM-DD optional
         log.info("props: league=%s (norm=%s) date=%s", league_in, league, date_str)
 
+        # Check for nocache parameter
+        nocache = request.args.get("nocache") == "1"
+        
         if league == "mlb":
-            props = fetch_mlb_player_props()
+            if nocache:
+                props = fetch_mlb_player_props()
+                set_cached("mlb", props)
+            else:
+                props = get_or_set("mlb", fetch_mlb_player_props)
             # Group by matchup - need to create matchup from event data
             grouped = {}
             for prop in props:
@@ -447,7 +467,11 @@ def get_props():
             return jsonify(grouped)
 
         elif league == "nfl":
-            props = fetch_nfl_player_props(hours_ahead=96)
+            if nocache:
+                props = fetch_nfl_player_props(hours_ahead=96)
+                set_cached("nfl", props)
+            else:
+                props = get_or_set("nfl", lambda: fetch_nfl_player_props(hours_ahead=96))
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -458,7 +482,11 @@ def get_props():
             return jsonify(grouped)
 
         elif league == "ncaaf":
-            props = fetch_ncaaf_player_props(date=date_str)
+            if nocache:
+                props = fetch_ncaaf_player_props(date=date_str)
+                set_cached("ncaaf", props)
+            else:
+                props = get_or_set("ncaaf", lambda: fetch_ncaaf_player_props(date=date_str))
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -470,7 +498,11 @@ def get_props():
 
         elif league == "ufc":
             # Use the existing UFC totals function
-            props = fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96)
+            if nocache:
+                props = fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96)
+                set_cached("ufc", props)
+            else:
+                props = get_or_set("ufc", lambda: fetch_ufc_totals_props(date_iso=date_str, hours_ahead=96))
             # Group by matchup
             grouped = {}
             for prop in props:
@@ -486,6 +518,65 @@ def get_props():
     except Exception as e:
         log.exception("props endpoint failure")
         return jsonify({"error": str(e)}), 503
+
+@app.route("/ai/edge_scout")
+@cache_ttl(seconds=60)
+def ai_edge_scout():
+    """
+    AI-assisted shortlist: uses our no-vig probs & best prices, plus trends,
+    to propose undervalued props with brief rationales.
+    v1: MLB only (expand later).
+    """
+    from openai import OpenAI
+    league_in = request.args.get("league")
+    league = _norm_league(league_in)
+    if league != "mlb":
+        return jsonify({"error": f"league '{league_in}' not supported in v1"}), 400
+
+    # pull rows using universal cache (already wired in app.py)
+    rows = get_or_set("mlb", fetch_mlb_player_props)
+    payload = build_llm_payload(rows, top_k=30)
+
+    # require OPENAI_API_KEY in env (Render: add it under Environment)
+    try:
+        client = OpenAI()
+    except Exception as e:
+        return jsonify({"error": "OPENAI_API_KEY not configured", "detail": str(e)}), 503
+
+    llm_json = llm_scout(client, payload)
+    picks = merge_and_gate(llm_json)
+
+    # split into base vs upgrade (max 10 each)
+    base = [p for p in picks if p.get("type") == "base"][:10]
+    upg  = [p for p in picks if p.get("type") == "upgrade"][:10]
+    
+    # Collect unique player names from the top results for trends
+    all_player_names = list(set([p["player"] for p in base + upg]))
+    name_to_trend = {}
+    try:
+        from mlb_trends import trends_by_player_names
+        name_to_trend = trends_by_player_names(all_player_names)
+    except Exception:
+        name_to_trend = {}
+    
+    # Attach trends to each pick
+    for picks_list in [base, upg]:
+        for pick in picks_list:
+            t = name_to_trend.get(pick["player"])
+            if t:
+                pick["trends"] = {
+                    "l10_hit_rate": t.get("l10_hit_rate"),
+                    "l10_tb_avg": t.get("l10_tb_avg"),
+                    "multi_hit_rate": t.get("multi_hit_rate"),
+                    "xbh_rate": t.get("xbh_rate"),
+                }
+
+    return jsonify({
+        "league": league,
+        "base": base,
+        "upgrades": upg,
+        "count": {"base": len(base), "upgrades": len(upg)}
+    })
 
 # Stub endpoints to avoid UI errors
 @app.route("/contextual/hit_rates", methods=["POST"])
@@ -509,6 +600,32 @@ def ping():
     """Ping endpoint"""
     return jsonify({"status": "running"})
 
+@app.route("/_cron/prewarm")
+def cron_prewarm():
+    # protect with a simple shared secret
+    token = request.args.get("key")
+    if token != os.getenv("CRON_KEY"):
+        return jsonify({"error":"unauthorized"}), 401
+    leagues = request.args.get("leagues","mlb,nfl,ncaaf,ufc").split(",")
+    out = {}
+    for L in [l.strip() for l in leagues if l.strip()]:
+        if L == "mlb":
+            props = fetch_mlb_player_props()
+        elif L == "nfl":
+            from nfl_odds_api import fetch_nfl_player_props
+            props = fetch_nfl_player_props()
+        elif L == "ncaaf":
+            from props_ncaaf import fetch_ncaaf_player_props
+            props = fetch_ncaaf_player_props()
+        elif L == "ufc":
+            from props_ufc import fetch_ufc_totals_props
+            props = fetch_ufc_totals_props(hours_ahead=96)
+        else:
+            continue
+        set_cached(L, props)
+        out[L] = len(props) if isinstance(props, list) else "ok"
+    return jsonify({"prewarmed": out})
+
 @app.route("/logout")
 def logout():
     """Clear license session for testing"""
@@ -525,4 +642,4 @@ def perf_cache():
     return jsonify({"cache": cache_metrics()})
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5001)
