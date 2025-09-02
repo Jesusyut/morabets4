@@ -35,6 +35,15 @@ from ai_scout import build_llm_payload, llm_scout, merge_and_gate
 # Universal cache imports
 from universal_cache import get_or_set_slot, slot_key, set_json, get_json, current_slot
 
+# tolerant import for whatever name your AI analysis uses in the new zip
+try:
+    from ai_overlay.mlb import attach_mlb_ai_overlay as _attach_edges
+except Exception:
+    try:
+        from ai_scout import attach_ai_edges as _attach_edges      # alt name
+    except Exception:
+        _attach_edges = None
+
 log = logging.getLogger("app")
 log.setLevel(logging.INFO)
 
@@ -453,6 +462,18 @@ def get_props():
                 set_json(slot_key("props", "mlb"), props)
             else:
                 props = get_or_set_slot("props", "mlb", fetch_mlb_player_props)
+            
+            # Attach AI overlay if available
+            ai_attached = 0
+            min_edge = float(os.getenv("AI_MIN_EDGE", "0.06"))
+
+            if _attach_edges is not None and os.getenv("AI_OVERLAY_ENABLED","true").lower() in ("1","true","on"):
+                try:
+                    # cap=120 avoids heavy work on each request; cached payload will hide latency anyway
+                    ai_attached = _attach_edges(props, min_edge=min_edge, cap=int(os.getenv("AI_ATTACH_CAP","120")))
+                except Exception as _e:
+                    ai_attached = 0  # fail safe
+            
             # Group by matchup - need to create matchup from event data
             grouped = {}
             for prop in props:
@@ -464,7 +485,11 @@ def get_props():
                 if matchup not in grouped:
                     grouped[matchup] = []
                 grouped[matchup].append(prop)
-            return jsonify(grouped)
+            
+            # Build response with meta including ai_attached
+            meta = {"league": league, "date": date_str, "ai_attached": ai_attached}
+            payload = {"props": props, "meta": meta, "groups": grouped}
+            return jsonify(payload)
 
         elif league == "nfl":
             from nfl_odds_api import fetch_nfl_player_props
@@ -480,7 +505,11 @@ def get_props():
                 if matchup not in grouped:
                     grouped[matchup] = []
                 grouped[matchup].append(prop)
-            return jsonify(grouped)
+            
+            # Build response with meta
+            meta = {"league": league, "date": date_str, "ai_attached": 0}
+            payload = {"props": props, "meta": meta, "groups": grouped}
+            return jsonify(payload)
 
         elif league == "ncaaf":
             from props_ncaaf import fetch_ncaaf_player_props
@@ -496,7 +525,11 @@ def get_props():
                 if matchup not in grouped:
                     grouped[matchup] = []
                 grouped[matchup].append(prop)
-            return jsonify(grouped)
+            
+            # Build response with meta
+            meta = {"league": league, "date": date_str, "ai_attached": 0}
+            payload = {"props": props, "meta": meta, "groups": grouped}
+            return jsonify(payload)
 
         elif league == "ufc":
             # Use the existing UFC totals function
@@ -513,7 +546,11 @@ def get_props():
                 if matchup not in grouped:
                     grouped[matchup] = []
                 grouped[matchup].append(prop)
-            return jsonify(grouped)
+            
+            # Build response with meta
+            meta = {"league": league, "date": date_str, "ai_attached": 0}
+            payload = {"props": props, "meta": meta, "groups": grouped}
+            return jsonify(payload)
 
         else:
             raise ValueError(f"Unsupported league: {league_in}")
