@@ -626,6 +626,7 @@ def fetch_player_props():
                 "player": player,
                 "stat":   stat_key,
                 "line":   point,
+                "matchup": matchup_key,
             }
 
             # A) populate shop (for no-vig) + generic fallback fields
