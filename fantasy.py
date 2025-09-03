@@ -9,13 +9,8 @@ MLB_STATS_API = "https://statsapi.mlb.com/api/v1"
 def get_player_id(player_name):
     """Get MLB player ID from name"""
     try:
-        resp = requests.get(
-            f"{MLB_STATS_API}/people/search", 
-            params={"names": player_name},
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        from mlb_http import get_json
+        data = get_json("people/search", {"names": player_name})
         
         if data.get("people"):
             return data["people"][0]["id"]
@@ -84,17 +79,12 @@ def get_fantasy_hit_rate(player_name, threshold=6):
             return {"error": f"Player '{player_name}' not found"}
 
         # Get game logs with safe API access
-        logs_resp = requests.get(
-            f"{MLB_STATS_API}/people/{player_id}/stats",
-            params={
-                "stats": "gameLog",
-                "season": str(datetime.utcnow().year),
-                "group": "hitting"
-            },
-            timeout=10
-        )
-        logs_resp.raise_for_status()
-        logs_data = logs_resp.json()
+        from mlb_http import get_json
+        logs_data = get_json(f"people/{player_id}/stats", {
+            "stats": "gameLog",
+            "season": str(datetime.utcnow().year),
+            "group": "hitting"
+        })
         
         # Safe access to stats array
         stats_array = logs_data.get("stats", [])

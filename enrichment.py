@@ -4,6 +4,7 @@ import logging
 import json
 import time
 import os
+from mlb_http import get_json
 
 # --- NEW: MLB player-id resolver (cached) ---
 from functools import lru_cache
@@ -104,20 +105,11 @@ def apply_park_factor(prop, stadium_name):
 def get_recent_form_multiplier(player_id, stat_type):
     """Calculate recent form multiplier based on last 5 games vs season average"""
     try:
-        response = requests.get(
-            f"{MLB_STATS_API}/people/{player_id}/stats",
-            params={
-                "stats": "gameLog",
-                "season": str(datetime.utcnow().year),
-                "group": "hitting" if "batter_" in stat_type else "pitching"
-            },
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            return 1.0
-            
-        data = response.json()
+        data = get_json(f"people/{player_id}/stats", {
+            "stats": "gameLog",
+            "season": str(datetime.utcnow().year),
+            "group": "hitting" if "batter_" in stat_type else "pitching"
+        })
         stats = data.get("stats", [])
         if not stats:
             return 1.0
@@ -246,13 +238,7 @@ def get_player_id(player_name):
         return cached_data['player_id']
     
     try:
-        response = requests.get(
-            f"{MLB_STATS_API}/people/search", 
-            params={"names": player_name},
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = get_json("people/search", {"names": player_name})
         
         player_id = None
         if data.get("people"):
@@ -265,36 +251,28 @@ def get_player_id(player_name):
         }
         
         return player_id
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching player ID for {player_name}: {e}")
-        return None
     except Exception as e:
-        logger.error(f"Unexpected error getting player ID for {player_name}: {e}")
+        logger.error(f"Error fetching player ID for {player_name}: {e}")
         return None
 
 def get_opponent_context(player_id):
     """Return (team_id, opponent_id, pitcher_hand) for today's or next scheduled game."""
     try:
         # get player's current team
-        p = requests.get(f"{MLB_STATS_API}/people/{player_id}",
-                         params={"hydrate":"currentTeam"}, timeout=10).json()
+        p = get_json(f"people/{player_id}", {"hydrate":"currentTeam"})
         team_id = (p.get("people") or [{}])[0].get("currentTeam", {}).get("id")
         if not team_id:
             return None
 
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        sch = requests.get(f"{MLB_STATS_API}/schedule",
-                           params={"teamId": team_id, "date": today,
-                                   "hydrate":"probablePitcher,probablePitcher(note),linescore"},
-                           timeout=10).json()
+        sch = get_json("schedule", {"teamId": team_id, "date": today,
+                                   "hydrate":"probablePitcher,probablePitcher(note),linescore"})
         dates = sch.get("dates") or []
         if not dates:
             # no game today — get next game
-            sch = requests.get(f"{MLB_STATS_API}/schedule",
-                               params={"teamId": team_id, "startDate": today,
+            sch = get_json("schedule", {"teamId": team_id, "startDate": today,
                                        "endDate": today, "sportId": 1,
-                                       "hydrate":"probablePitcher"},
-                               timeout=10).json()
+                                       "hydrate":"probablePitcher"})
             dates = sch.get("dates") or []
         if not dates:
             return None
@@ -310,8 +288,7 @@ def get_opponent_context(player_id):
         prob = game["teams"].get(tkey, {}).get("probablePitcher") or {}
         if prob and "id" in prob:
             # look up hand
-            pd = requests.get(f"{MLB_STATS_API}/people/{prob['id']}",
-                              params={"hydrate":"pitchHand"}, timeout=10).json()
+            pd = get_json(f"people/{prob['id']}", {"hydrate":"pitchHand"})
             side = (pd.get("people") or [{}])[0].get("pitchHand", {}).get("code")
         return (team_id, opponent_id, side)
     except Exception:
@@ -455,14 +432,10 @@ def get_contextual_hit_rate(player_name, stat_type, threshold=1):
             team_id, opponent_id, pitcher_hand = context
 
         # fetch logs (same as before but use computed season)
-        logs_resp = requests.get(
-            f"{MLB_STATS_API}/people/{player_id}/stats",
-            params={"stats": "gameLog", "season": season,
-                    "group": "pitching" if stat_type.startswith("pitcher_") else "hitting"},
-            timeout=10
-        )
-        logs_resp.raise_for_status()
-        logs = logs_resp.json().get("stats", [{}])[0].get("splits", [])
+        logs = get_json(f"people/{player_id}/stats", {
+            "stats": "gameLog", "season": season,
+            "group": "pitching" if stat_type.startswith("pitcher_") else "hitting"
+        }).get("stats", [{}])[0].get("splits", [])
 
         # sample selection:
         if opponent_id:
@@ -473,7 +446,8 @@ def get_contextual_hit_rate(player_name, stat_type, threshold=1):
         if not filtered:
             filtered = logs[-10:]  # never return empty sample
         if not filtered:
-            return get_fallback_hit_rate(player_name, stat_type, threshold)
+            # still nothing? return a sane fallback, not zeros
+            return {"hit_rate": 0.5, "sample_size": 0, "confidence": "Low"}
 
         # map stat key
         stat_key = get_stat_mapping(stat_type)
@@ -521,17 +495,11 @@ def get_fantasy_hit_rate(player_name, threshold=6):
             return get_fallback_hit_rate(player_name, "fantasy_score", threshold)
 
         # Get game logs safely
-        logs_resp = requests.get(
-            f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats",
-            params={
-                "stats": "gameLog",
-                "season": str(datetime.utcnow().year),
-                "group": "hitting"
-            },
-            timeout=10
-        )
-        logs_resp.raise_for_status()
-        logs_data = logs_resp.json()
+        logs_data = get_json(f"people/{player_id}/stats", {
+            "stats": "gameLog",
+            "season": str(datetime.utcnow().year),
+            "group": "hitting"
+        })
         
         # Safe stats access
         stats_array = logs_data.get("stats", [])
@@ -579,9 +547,7 @@ def get_player_team_mapping():
         
         # Fetch fresh data from MLB Stats API
         print("[INFO] Fetching fresh player-team mapping from MLB Stats API...")
-        teams_url = "https://statsapi.mlb.com/api/v1/teams?leagueIds=103,104"
-        teams_response = requests.get(teams_url, timeout=10)
-        teams_data = teams_response.json()
+        teams_data = get_json("teams", {"leagueIds": "103,104"})
         
         player_team_map = {}
         
@@ -593,10 +559,8 @@ def get_player_team_mapping():
                 continue
                 
             # Get roster for this team
-            roster_url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active"
             try:
-                roster_response = requests.get(roster_url, timeout=5)
-                roster_data = roster_response.json()
+                roster_data = get_json(f"teams/{team_id}/roster", {"rosterType": "active"})
                 
                 for player_info in roster_data.get("roster", []):
                     player = player_info.get("person", {})
