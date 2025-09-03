@@ -597,6 +597,33 @@ def api_trends_l10():
     """Stub endpoint - returns empty results"""
     return jsonify({"results": []})
 
+@app.route("/api/ai_scout")
+def api_ai_scout():
+    # league param: mlb (default), nfl, etc. – today we'll do mlb only
+    league = (request.args.get("league") or "mlb").lower()
+    refresh = (request.args.get("refresh") == "1")
+
+    # 1) pull rows from your existing pipeline
+    rows = []
+    if league == "mlb":
+        from odds_api import fetch_player_props as fetch_mlb_player_props
+        rows = fetch_mlb_player_props()
+    # elif league == "nfl": from nfl_odds_api import fetch_nfl_player_props; rows = fetch_nfl_player_props(...)
+
+    # 2) OpenAI client
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return jsonify({"ok": False, "error": "OPENAI_API_KEY missing"}), 500
+    client = OpenAI(api_key=api_key)
+
+    # 3) run your cached scout (returns {league, base, upgrades, count})
+    try:
+        top_k = int(os.getenv("AI_SCOUT_TOPK", "30"))
+        out = scout_cached_for_league(client, rows, league=league, top_k=top_k, force_refresh=refresh)
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # Health and utility endpoints
 @app.route("/healthz")
 def healthz():
