@@ -97,7 +97,6 @@
     <div class="toolbar">
       <input id="q" class="search" placeholder="Search players or stats…" />
       <div id="sortMode" class="tabs" style="margin-left:auto">
-        <button id="sortFair" class="tab sorttab" data-sort="fair">Fair</button>
         <button id="sortEdge" class="tab sorttab" data-sort="edge">AI Edge Finder</button>
         <button id="btn-ai-scout" class="tab" style="margin-left:12px;">View AI Picks</button>
       </div>
@@ -127,7 +126,7 @@
   function americanToProb(odds){ if(odds==null) return 0; const o=Number(odds); if(!isFinite(o)||o===0) return 0; return o>0?100/(o+100):(-o)/(100-o); }
 
   // -------------- sorting logic --------------
-  let SORTMODE = localStorage.getItem('sortMode') || 'fair';
+  let SORTMODE = localStorage.getItem('sortMode') || 'edge';
   let PROPS_CACHE = []; // last fetched list
 
   function sortProps(props, mode) {
@@ -156,7 +155,6 @@
     const bar = document.getElementById('sortMode');
     if (!bar) return;
     function sync(){
-      document.getElementById('sortFair')?.classList.toggle('active', SORTMODE === 'fair');
       document.getElementById('sortEdge')?.classList.toggle('active', SORTMODE === 'edge');
     }
     bar.addEventListener('click', (e)=>{
