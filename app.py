@@ -30,7 +30,7 @@ except Exception:
         def deco(fn): return fn
         return deco
 
-from ai_scout import build_llm_payload, llm_scout, merge_and_gate
+from ai_scout import attach_ai_edges, get_ai_picks_cached  # NEW
 
 # Universal cache imports
 from universal_cache import get_or_set_slot, slot_key, set_json, get_json, current_slot
@@ -76,6 +76,11 @@ PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_ID_MONTHLY")
 PRICE_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY")
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:5000")
+
+# AI Overlay configuration
+AI_OVERLAY_ENABLED = os.getenv("AI_OVERLAY_ENABLED", "true").lower() in ("1", "true", "yes")
+AI_MIN_EDGE = float(os.getenv("AI_MIN_EDGE", "0.06"))
+AI_ATTACH_CAP = int(os.getenv("AI_ATTACH_CAP", "120"))
 
 # Legacy price lookup for backward compatibility
 PRICE_LOOKUP = {
@@ -465,14 +470,12 @@ def get_props():
             
             # Attach AI overlay if available
             ai_attached = 0
-            min_edge = float(os.getenv("AI_MIN_EDGE", "0.06"))
-
-            if _attach_edges is not None and os.getenv("AI_OVERLAY_ENABLED","true").lower() in ("1","true","on"):
+            if AI_OVERLAY_ENABLED:
                 try:
-                    # cap=120 avoids heavy work on each request; cached payload will hide latency anyway
-                    ai_attached = _attach_edges(props, min_edge=min_edge, cap=int(os.getenv("AI_ATTACH_CAP","120")))
-                except Exception as _e:
-                    ai_attached = 0  # fail safe
+                    ai_attached = attach_ai_edges(props, min_edge=AI_MIN_EDGE, cap=AI_ATTACH_CAP)
+                except Exception as e:
+                    log.exception("attach_ai_edges failed: %s", e)
+                    ai_attached = 0
             
             # Group by matchup - need to create matchup from event data
             grouped = {}
@@ -599,30 +602,33 @@ def api_trends_l10():
 
 @app.route("/api/ai_scout")
 def api_ai_scout():
-    # league param: mlb (default), nfl, etc. – today we'll do mlb only
-    league = (request.args.get("league") or "mlb").lower()
-    refresh = (request.args.get("refresh") == "1")
-
-    # 1) pull rows from your existing pipeline
-    rows = []
+    league = request.args.get("league", "mlb").lower()
+    # build slate the same way as /player_props but without pagination (or reuse cached rows)
+    # if you have a function to get props quickly, use it; below assumes props is available:
+    # props = get_props_for_league(league)  # pseudocode; if not available, reconstruct similarly
     if league == "mlb":
         from odds_api import fetch_player_props as fetch_mlb_player_props
-        rows = fetch_mlb_player_props()
-    # elif league == "nfl": from nfl_odds_api import fetch_nfl_player_props; rows = fetch_nfl_player_props(...)
+        props = fetch_mlb_player_props()
+    elif league == "nfl":
+        from nfl_odds_api import fetch_nfl_player_props
+        props = fetch_nfl_player_props()
+    elif league == "ncaaf":
+        from props_ncaaf import fetch_ncaaf_player_props
+        props = fetch_ncaaf_player_props()
+    elif league == "ufc":
+        from props_ufc import fetch_ufc_totals_props
+        props = fetch_ufc_totals_props()
+    else:
+        return jsonify({"error": f"Unsupported league: {league}"}), 400
 
-    # 2) OpenAI client
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return jsonify({"ok": False, "error": "OPENAI_API_KEY missing"}), 500
-    client = OpenAI(api_key=api_key)
-
-    # 3) run your cached scout (returns {league, base, upgrades, count})
+    # ensure overlay is attached for picks quality
     try:
-        top_k = int(os.getenv("AI_SCOUT_TOPK", "30"))
-        out = scout_cached_for_league(client, rows, league=league, top_k=top_k, force_refresh=refresh)
-        return jsonify({"ok": True, **out})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        attach_ai_edges(props, min_edge=AI_MIN_EDGE, cap=AI_ATTACH_CAP)
+    except Exception:
+        pass
+
+    data = get_ai_picks_cached(league.upper(), None, props)
+    return jsonify(data)
 
 # Health and utility endpoints
 @app.route("/healthz")

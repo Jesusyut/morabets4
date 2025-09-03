@@ -145,6 +145,23 @@
     return [...props].sort((a, b) => (b.fair?.prob?.over ?? 0) - (a.fair?.prob?.over ?? 0));
   }
 
+  // ensure 'edge' sort reads p.ai?.edge_over (fallback 0)
+  function valueForSort(p) {
+    if (SORTMODE === 'edge') return (p.ai && typeof p.ai.edge_over === 'number') ? p.ai.edge_over : 0;
+    // keep other modes if you have them
+    return (p.fair && p.fair.prob && p.fair.prob.over) || 0;
+  }
+
+  // Edge badge rendering (existing CSS ok)
+  function edgeBadge(p) {
+    const e = (p.ai && p.ai.edge_over) || 0;
+    if (e >= (window.AI_MIN_EDGE || 0.06)) {
+      const pct = Math.round(e * 100);
+      return `<span class="edge-badge">Edge +${pct}%</span>`;
+    }
+    return '';
+  }
+
   function resortAndRender(){
     const arr = sortProps(PROPS_CACHE, SORTMODE);
     countEl.textContent = arr.length.toLocaleString();
