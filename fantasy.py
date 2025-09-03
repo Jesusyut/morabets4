@@ -88,7 +88,7 @@ def get_fantasy_hit_rate(player_name, threshold=6):
             f"{MLB_STATS_API}/people/{player_id}/stats",
             params={
                 "stats": "gameLog",
-                "season": "2025",
+                "season": str(datetime.utcnow().year),
                 "group": "hitting"
             },
             timeout=10

@@ -15,7 +15,7 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
 @lru_cache(maxsize=4096)
-def _mlb_player_id_cache(norm_name: str) -> str | None:
+def _mlb_player_id_cache(norm_name: str):
     """
     Resolve MLB player id from StatsAPI using the search endpoint.
     Cached in-process via lru_cache to avoid repeated calls.
@@ -43,7 +43,7 @@ def _mlb_player_id_cache(norm_name: str) -> str | None:
         return None
     return None
 
-def resolve_mlb_player_id(full_name: str) -> str | None:
+def resolve_mlb_player_id(full_name: str):
     """Public wrapper: normalizes and queries the cached resolver."""
     return _mlb_player_id_cache(_normalize_name(full_name or ""))
 
@@ -108,7 +108,7 @@ def get_recent_form_multiplier(player_id, stat_type):
             f"{MLB_STATS_API}/people/{player_id}/stats",
             params={
                 "stats": "gameLog",
-                "season": "2025",
+                "season": str(datetime.utcnow().year),
                 "group": "hitting" if "batter_" in stat_type else "pitching"
             },
             timeout=10
@@ -273,36 +273,48 @@ def get_player_id(player_name):
         return None
 
 def get_opponent_context(player_id):
-    """Get current opponent context for a player"""
+    """Return (team_id, opponent_id, pitcher_hand) for today's or next scheduled game."""
     try:
+        # get player's current team
+        p = requests.get(f"{MLB_STATS_API}/people/{player_id}",
+                         params={"hydrate":"currentTeam"}, timeout=10).json()
+        team_id = (p.get("people") or [{}])[0].get("currentTeam", {}).get("id")
+        if not team_id:
+            return None
+
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        schedule_resp = requests.get(
-            f"{MLB_STATS_API}/people/{player_id}/stats",
-            params={
-                "stats": "gameLog",
-                "season": "2025",
-                "group": "hitting"
-            },
-            timeout=10
-        )
-        schedule_resp.raise_for_status()
-        data = schedule_resp.json()
-        
-        logs = data.get("stats", [{}])[0].get("splits", [])
-        
-        for log in logs:
-            if log.get("date") == today:
-                return (
-                    log.get("team", {}).get("id"),
-                    log.get("opponent", {}).get("id"),
-                    log.get("pitcher", {}).get("hand", {}).get("code")
-                )
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching opponent context for player {player_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error getting opponent context for player {player_id}: {e}")
+        sch = requests.get(f"{MLB_STATS_API}/schedule",
+                           params={"teamId": team_id, "date": today,
+                                   "hydrate":"probablePitcher,probablePitcher(note),linescore"},
+                           timeout=10).json()
+        dates = sch.get("dates") or []
+        if not dates:
+            # no game today — get next game
+            sch = requests.get(f"{MLB_STATS_API}/schedule",
+                               params={"teamId": team_id, "startDate": today,
+                                       "endDate": today, "sportId": 1,
+                                       "hydrate":"probablePitcher"},
+                               timeout=10).json()
+            dates = sch.get("dates") or []
+        if not dates:
+            return None
+
+        game = dates[0]["games"][0]
+        home = game["teams"]["home"]["team"]["id"]
+        away = game["teams"]["away"]["team"]["id"]
+        opponent_id = away if home == team_id else home
+
+        # pitcher hand if available
+        side = None
+        tkey = "away" if home == team_id else "home"
+        prob = game["teams"].get(tkey, {}).get("probablePitcher") or {}
+        if prob and "id" in prob:
+            # look up hand
+            pd = requests.get(f"{MLB_STATS_API}/people/{prob['id']}",
+                              params={"hydrate":"pitchHand"}, timeout=10).json()
+            side = (pd.get("people") or [{}])[0].get("pitchHand", {}).get("code")
+        return (team_id, opponent_id, side)
+    except Exception:
         return None
 
 def get_stat_mapping(stat_type):
@@ -432,61 +444,52 @@ def get_fallback_hit_rate(player_name, stat_type, threshold):
 def get_contextual_hit_rate(player_name, stat_type, threshold=1):
     """Get contextual hit rate with comprehensive stat type support and fallback calculations"""
     try:
+        season = str(datetime.utcnow().year)
         player_id = get_player_id(player_name)
         if not player_id:
             return get_fallback_hit_rate(player_name, stat_type, threshold)
 
-        context = get_opponent_context(player_id)
-        if not context:
-            return get_fallback_hit_rate(player_name, stat_type, threshold)
-        
-        team_id, opponent_id, pitcher_hand = context
+        context = get_opponent_context(player_id)  # may be None
+        team_id = opponent_id = pitcher_hand = None
+        if context:
+            team_id, opponent_id, pitcher_hand = context
 
-        # Determine if it's a pitching or batting stat
-        is_pitching_stat = stat_type.startswith("pitcher_")
-        group = "pitching" if is_pitching_stat else "hitting"
-
-        # Get game logs
+        # fetch logs (same as before but use computed season)
         logs_resp = requests.get(
             f"{MLB_STATS_API}/people/{player_id}/stats",
-            params={
-                "stats": "gameLog",
-                "season": "2025",
-                "group": group
-            },
+            params={"stats": "gameLog", "season": season,
+                    "group": "pitching" if stat_type.startswith("pitcher_") else "hitting"},
             timeout=10
         )
         logs_resp.raise_for_status()
-        logs_data = logs_resp.json()
-        
-        logs = logs_data.get("stats", [{}])[0].get("splits", [])
+        logs = logs_resp.json().get("stats", [{}])[0].get("splits", [])
 
-        # Filter for contextual games (same opponent and pitcher handedness)
-        filtered = [
-            game for game in logs[:10]
-            if (game.get("opponent", {}).get("id") == opponent_id and
-                game.get("pitcher", {}).get("hand", {}).get("code") == pitcher_hand)
-        ]
+        # sample selection:
+        if opponent_id:
+            filtered = [g for g in logs if g.get("opponent", {}).get("id") == opponent_id]
+        else:
+            filtered = logs[-10:]  # robust default
 
+        if not filtered:
+            filtered = logs[-10:]  # never return empty sample
         if not filtered:
             return get_fallback_hit_rate(player_name, stat_type, threshold)
 
-        # Map stat type to API field name
-        api_field = get_stat_mapping(stat_type)
-        
-        # Count games where player exceeded threshold
-        over_count = 0
-        for game in filtered:
-            game_stat = game.get("stat", {})
-            if api_field in ["hits_runs_rbis", "fantasy_score"]:
-                stat_value = calculate_custom_stat(game_stat, api_field)
-            else:
-                stat_value = game_stat.get(api_field, 0)
-            
-            if stat_value >= threshold:
-                over_count += 1
-        
-        hit_rate = round(over_count / len(filtered), 2) if filtered else 0.0
+        # map stat key
+        stat_key = get_stat_mapping(stat_type)
+
+        # value extractor (handles custom stats)
+        def game_value(g):
+            s = g.get("stat", {})
+            if stat_key == "hits_runs_rbis":
+                return (s.get("hits", 0) + s.get("runs", 0) + s.get("rbi", 0))
+            elif stat_key == "fantasy_score":
+                from fantasy import calculate_fantasy_points
+                return calculate_fantasy_points(s)
+            return s.get(stat_key, 0)
+
+        over = sum(1 for g in filtered if game_value(g) >= float(threshold))
+        hit_rate = round(over / len(filtered), 4)
 
         return {
             "player": player_name,
@@ -522,7 +525,7 @@ def get_fantasy_hit_rate(player_name, threshold=6):
             f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats",
             params={
                 "stats": "gameLog",
-                "season": "2025",
+                "season": str(datetime.utcnow().year),
                 "group": "hitting"
             },
             timeout=10

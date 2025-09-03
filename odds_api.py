@@ -749,7 +749,11 @@ def enrich_prop(prop):
             # Park Factor Analysis
             stadium = prop.get("venue", "")
             if stadium:
-                park_multiplier = apply_park_factor(prop, stadium)
+                # when calling apply_park_factor / recent_form multipliers, pass the stat string:
+                stat_type = (prop.get("stat") or "").lower()
+                prop_normalized = {"stat_type": stat_type}  # minimal shape
+                prop_normalized.update(prop)  # merge with original prop
+                park_multiplier = apply_park_factor(prop_normalized, stadium)
                 if park_multiplier != 1.0:
                     enhanced_multiplier *= park_multiplier
                     enhancement_factors.append(f"Park: {park_multiplier:.2f}")
